@@ -69,12 +69,18 @@ def evaluate_qa(query: str, response: str, answer: str, model: str | None = None
     if model:
         response_message = generate_together(
             model=model,
+            temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant. You are given a question, response, and ground truth answer. You need to check whether the response correctly answers the question, based on the ground truth answer. If it is, return 'correct'. If it is not, return 'incorrect'. Only return either 'correct' or 'incorrect', without any other text."},
                 {"role": "user", "content": f"Question: {query}\nResponse: {response}\nGround Truth Answer: {answer}."}
             ]
         )
-        return response_message.content.strip().lower().startswith("correct")
+        # 第 3 讲的结果验证：只在生成结束后把参考答案交给裁判。
+        # 裁判离线或输出格式错误时暂停实验，避免把服务故障计为答错。
+        verdict = (getattr(response_message, "content", None) or "").strip().lower().rstrip(".")
+        if verdict not in {"correct", "incorrect"}:
+            raise RuntimeError("评审模型未返回有效判定；请检查模型配置后重新评估。")
+        return verdict == "correct"
     else:
         answer_words = set(word.strip('.,!?()[]{}":;') for word in str(answer).lower().split())
         return all(word in str(response).lower() for word in answer_words if word)
