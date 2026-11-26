@@ -37,8 +37,43 @@ if (!(Test-Path .env)) { Copy-Item -LiteralPath .env.example -Destination .env }
 
 Part 0–2 的四种方法共用 `COMPARISON_DEBUG` 开关。默认每类取两题，共 8 题。切换为 `False` 并重新运行比较单元，可以得到同一批 15 题上的四个分数和柱状图。Part 3 总是在全部 15 题上评估基线和完整流程，至少答对 11 题才超过原题的 70% 门槛。评审模型未返回有效判定时，Notebook 会暂停，便于检查服务配置后重新测量。
 
+Part 3 的规划器会按地点、交易日和当地日期拆分独立查询。比较全天风速时，每座城市的记录含当天逐小时数据的平均值、最大值和有效样本数。行情首查失败时，Part 3 还会查询 Yahoo Finance 的公开日线，核对股票代码、币种和纽约交易日，保留价格口径、来源链接及首查错误。Wolfram 不可用时，能由已知条件推出的数值可以由模型独立计算，输出会标明验证状态。Part 1 的股票和数学示例分别调用原题的行情与 Wolfram 接口，可以单独检查这两个服务是否接通。
+
 运行下面的命令可单独检查路由、证据传递、轮数上限、报告引用和故障处理。测试使用固定响应，因此在没有 API 凭据的环境也能运行；问答准确率由在线 Notebook 实验给出。
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+## 2026-11-26 的 llmtoken 实测
+
+[打开带逐题答案、评审结果、对比图和三份研究报告的 Notebook](results/llmtoken.ipynb)。公开副本省略了工具演示中重复打印的第三方网页摘录，保留标题和来源链接。
+
+| Part 0–2 同一组 8 题 | 答对 | 准确率 |
+| --- | ---: | ---: |
+| 零样本 | 8/8 | 100% |
+| 单工具 + 单模型 | 2/8 | 25% |
+| 拆题 + 多模型融合 | 5/8 | 62.5% |
+| 迭代补查，最多 4 轮 | 5/8 | 62.5% |
+
+全量 15 题上，零样本模型答对 **15/15**。第一版完整流程答对 **6/15**。改进按日期拆题、天气日统计、历史行情补查和工具失败后的处理后，使用同一裁判对 15 题全部重新生成、评审，答对 **13/15（86.7%）**。原题给出的全量满分门槛是超过 70%。这是按公开题集参考答案计算的模型裁判分数。
+
+全量零样本基线沿用了调试集中 8 道相同题目的原回答及原判定，并新跑另外 7 题。Part 3 的两次完整流程各自独立测完 15 题。改进后仍失分的两题是全天风速比较和电影片名。模型按取得的全天风速均值判断芝加哥稍高，但参考答案为波士顿；电影检索返回同名作品，因此模型未能确认目标片名。
+
+| 实验角色 | 上游作业中的模型 ID | 本次发送给 llmtoken 的模型 ID |
+| --- | --- | --- |
+| Part 0 零样本、Part 1e 路由与参数提取、最终融合、Part 4 单模型对照 | `meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo` | `deepseek-v4.1-flash` |
+| Part 1f 单工具作答、拆题和迭代补查、Part 3 全量零样本 | `meta-llama/Llama-3.3-70B-Instruct-Turbo-Free` | `deepseek-v4.1-flash` |
+| Part 2c 三个融合候选 | `google/gemma-3n-E4B-it`、`meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo`、`OpenAI/gpt-oss-20B` | `deepseek-v4.1-flash`、`qwen3.8`、`gpt-5.6-luna` |
+| 简答题裁判 | `google/gemma-3n-E4B-it` | `deepseek-v4.1-flash` |
+| Part 4 研究计划与报告综合 | 作业允许自选 | `deepseek-v4.1-flash` |
+
+网关在成功响应的 `model` 字段中分别回报 `deepseek-v4.1-flash`、`qwen3.8-max`、`grok-4.7`。后两项分别对应请求别名 `qwen3.8` 和 `gpt-5.6-luna`。这些名称来自回包，网关背后的实际部署无法独立核实。生成和裁判使用同一个 DeepSeek 标识，这一点也影响与原作业实验的可比性。
+
+## 阅读三份研究报告时可核对的细节
+
+三道原题各有一份单模型回答和一份检索报告。按固态电池、英国移民、核聚变的顺序，报告分别为 5 段/4 个来源、5 段/5 个来源和 4 段/8 个来源。下面的核查补充独立于模型生成的报告。
+
+- **固态电池。** QuantumScape 在 2024 年 10 月 23 日的股东信披露，QSE-5 B 样电芯开始小批生产并交给汽车客户测试。公司报告的体积能量密度超过 800 Wh/L，从 10% 充至 80% 用时不足 15 分钟。该信也列出良率、可靠性和设备产能方面的量产挑战。[QuantumScape 股东信，第 2 页](https://ir.quantumscape.com/static-files/8345451d-6901-42e0-838b-37c95cfa1da8)
+- **英国移民政策。** 报告援引的就业率来自 2021 年人口普查，统计范围是英格兰和威尔士的 16–64 岁人口。另一项可以单独核实的政策变化发生在 2024 年 4 月 4 日，适用 Skilled Worker 新规则的一般年薪门槛从 £26,200 升至 £38,700，医疗护理等类别及既有签证持有人另有规定。[英国国家统计局](https://www.ons.gov.uk/employmentandlabourmarket/peopleinwork/employmentandemployeetypes/articles/migrationandthelabourmarketenglandandwales/census2021) · [英国内政部](https://www.gov.uk/government/news/new-laws-to-cut-migration-and-put-british-workers-first-in-force)
+- **核聚变。** JET 取得 69 MJ 聚变能的实验发生在 2023 年 10 月 3 日，结果于 2024 年 2 月 8 日公布。另一个实际发生于 2024 年的例子是 NIF 在 11 月 18 日用 2.2 MJ 入靶激光能量取得 4.1 MJ 聚变产额。后者按入靶能量计算增益，整座设施的耗电量属于另一项指标。[JET 实验资料](https://www.ipp.mpg.de/5405892/jet_rekord_2024) · [UKAEA 公告](https://www.gov.uk/government/news/jets-final-tritium-experiments-yield-new-fusion-energy-record) · [LLNL 实验记录](https://lmf.llnl.gov/science/achieving-fusion-ignition)
