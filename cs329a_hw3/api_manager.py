@@ -20,7 +20,7 @@ from geopy.geocoders import Nominatim
 from geopy.location import Location
 from pydantic import BaseModel, Field
 
-from cs329a_hw3.utils import generate_together, get_model
+from cs329a_hw3.utils import generate_together, get_model, get_structured_output_mode
 
 
 class GoogleSearchParams(BaseModel):
@@ -102,9 +102,19 @@ class APIManager:
     def _structured_response(
         query: str, instruction: str, schema: type[Schema], model: str
     ) -> Schema | None:
-        # Together 的响应格式限制输出；本地仍验证字段和类型，再交给实际工具。
+        # 服务商支持的格式各有不同。每种模式都在本地校验字段和类型，再调用实际工具。
         schema_definition = schema.model_json_schema()
         schema_text = json.dumps(schema_definition, ensure_ascii=False)
+        mode = get_structured_output_mode()
+        response_format = None
+        if mode == "json_schema":
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {"name": schema.__name__, "schema": schema_definition},
+            }
+        elif mode == "json_object":
+            response_format = {"type": "json_object"}
+
         try:
             message = generate_together(
                 model=model,
@@ -115,15 +125,20 @@ class APIManager:
                     },
                     {"role": "user", "content": query},
                 ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": schema.__name__, "schema": schema_definition},
-                },
+                response_format=response_format,
                 temperature=0,
             )
             if message is None or not message.content:
                 return None
-            return schema.model_validate_json(message.content)
+            content = message.content.strip()
+            if mode == "prompt":
+                # 个别模型会给纯 JSON 加一层 Markdown 代码围栏。
+                fenced = re.fullmatch(
+                    r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```", content, re.IGNORECASE | re.DOTALL
+                )
+                if fenced is not None:
+                    content = fenced.group(1)
+            return schema.model_validate_json(content)
         except ValueError:
             return None
 

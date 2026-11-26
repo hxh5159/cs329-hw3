@@ -69,6 +69,39 @@ class APIManagerTests(unittest.TestCase):
         self.assertIn("error", output)
         request.assert_not_called()
 
+    def test_routes_with_json_object_and_prompt_only_providers(self):
+        examples = [
+            ("json_object", {"type": "json_object"}, message({"api_name": "compute"})),
+            ("prompt", None, SimpleNamespace(content='```json\n{"api_name":"compute"}\n```')),
+        ]
+        for mode, response_format, selection in examples:
+            with self.subTest(mode=mode):
+                with patch(f"{MODULE}.get_structured_output_mode", return_value=mode), patch(
+                    f"{MODULE}.generate_together",
+                    side_effect=[selection, message({"wolfram_query": "2+2"})],
+                ) as model:
+                    output = self.manager.route_query("What is 2+2?")
+
+                self.assertEqual(output["api_used"], "compute")
+                self.assertEqual(output["params"], {"wolfram_query": "2+2"})
+                self.assertEqual(model.call_count, 2)
+                for call in model.call_args_list:
+                    self.assertEqual(call.kwargs["response_format"], response_format)
+                    self.assertIn(
+                        "Return only JSON matching this schema", call.kwargs["messages"][0]["content"]
+                    )
+
+    def test_prompt_only_still_validates_tool_parameters(self):
+        with patch(f"{MODULE}.get_structured_output_mode", return_value="prompt"), patch(
+            f"{MODULE}.generate_together",
+            side_effect=[message({"api_name": "compute"}), message({"wolfram_query": []})],
+        ), patch.object(self.manager, "_get_json") as request:
+            output = self.manager.route_query("What is 2+2?")
+        self.assertEqual(output["api_used"], "compute")
+        self.assertEqual(output["params"], {})
+        self.assertIn("error", output)
+        request.assert_not_called()
+
     def test_route_preserves_tool_error_in_response(self):
         with patch(
             f"{MODULE}.generate_together",
