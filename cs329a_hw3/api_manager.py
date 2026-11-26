@@ -3,13 +3,17 @@ import json
 import os
 import re
 import socket
+from collections import Counter
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
+from math import isfinite
 from pathlib import Path
+from statistics import fmean
 from threading import Lock
 from typing import Any, Literal, TypeVar
 from urllib.parse import urljoin, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 import urllib3
@@ -65,6 +69,55 @@ def _city_geocoder(domain: str) -> Callable[[str], Location | None]:
             return cached(city)
 
     return geocode
+
+
+def _expected_local_hours(day: date, timezone_name: str | None) -> Counter[str] | None:
+    if not isinstance(timezone_name, str) or not timezone_name:
+        return None
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    start = datetime.combine(day, time.min, tzinfo=zone).astimezone(timezone.utc)
+    end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=zone).astimezone(timezone.utc)
+    duration = (end - start) / timedelta(hours=1)
+    if not duration.is_integer():
+        return None
+    # 按真实经过的小时遍历，夏令时切换日允许跳过或重复一个当地小时。
+    return Counter(
+        (start + timedelta(hours=hour)).astimezone(zone).strftime("%Y-%m-%dT%H:%M")
+        for hour in range(int(duration))
+    )
+
+
+def _summarize_daily_wind(hourly: dict, day: date, timezone_name: str | None) -> dict[str, Any]:
+    date_prefix = f"{day.isoformat()}T"
+    timestamps = hourly.get("time")
+    speeds = hourly.get("wind_speed_10m")
+    rows = zip(timestamps, speeds) if isinstance(timestamps, list) and isinstance(speeds, list) else ()
+    samples = [
+        (timestamp, speed)
+        for timestamp, speed in rows
+        if isinstance(timestamp, str) and timestamp.startswith(date_prefix)
+        and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", timestamp[len(date_prefix):])
+        and isinstance(speed, (int, float)) and not isinstance(speed, bool)
+        and isfinite(speed) and speed >= 0
+    ]
+    expected = _expected_local_hours(day, timezone_name)
+    coverage = "unknown"
+    if expected is not None:
+        observed = Counter(timestamp for timestamp, _ in samples)
+        coverage = "complete" if samples and observed == expected else "partial"
+    values = [speed for _, speed in samples]
+    return {
+        "date": day.isoformat(),
+        "mean_wind_speed": fmean(values) if values else None,
+        "max_wind_speed": max(values, default=None),
+        "wind_speed_unit": "km/h",
+        "sample_count": len(values),
+        "expected_sample_count": sum(expected.values()) if expected is not None else None,
+        "coverage": coverage,
+    }
 
 
 class APIManager:
@@ -162,7 +215,9 @@ class APIManager:
         )
         return parsed.model_dump() if parsed is not None else None
 
-    def route_query(self, query: str, model: str | None = None) -> dict[str, Any]:
+    def route_query(
+        self, query: str, model: str | None = None, *, include_daily_weather: bool = False
+    ) -> dict[str, Any]:
         """选择工具、抽取并校验参数，返回工具名称、参数和原始结果。"""
         output: dict[str, Any] = {"api_used": None, "params": {}, "results": None}
         if not query.strip():
@@ -191,7 +246,8 @@ class APIManager:
 
         output["params"] = params
         function, _ = self.api_functions[chosen.api_name]
-        results = function(**params)
+        options = {"include_daily_summary": True} if include_daily_weather and chosen.api_name == "get_weather" else {}
+        results = function(**params, **options)
         output["results"] = results
         if isinstance(results, dict) and "error" in results:
             output["error"] = results["error"]
@@ -426,8 +482,10 @@ class APIManager:
             "currency": "USD",
         }
 
-    def get_weather(self, location: str, date: str, hour: str = "12") -> dict[str, Any]:
-        """按所在地日期和当地小时查询温度、天气现象、湿度和 10 米高度风速。"""
+    def get_weather(
+        self, location: str, date: str, hour: str = "12", *, include_daily_summary: bool = False
+    ) -> dict[str, Any]:
+        """查询当地小时天气，可选汇总当天已经取得的 10 米风速样本。"""
         if not location.strip():
             return {"error": "Provide a location for the weather query."}
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) or not re.fullmatch(r"\d{1,2}", hour):
@@ -474,16 +532,26 @@ class APIManager:
 
         # 按本地时间戳定位这一小时；模型可直接使用结果中的摄氏或华氏温度。
         timestamp = f"{date}T{local_hour:02d}:00"
+        hourly = result.get("hourly")
+        if not isinstance(hourly, dict):
+            return {"error": f"Open-Meteo has no record for {timestamp} local time."}
+        daily_summary = None
+        if include_daily_summary:
+            daily_summary = _summarize_daily_wind(hourly, requested_day, result.get("timezone"))
+
+        hourly_error = None
         try:
-            hourly = result["hourly"]
             index = hourly["time"].index(timestamp)
             temperature, humidity, wind_speed, code = (hourly[field][index] for field in fields)
         except (AttributeError, KeyError, IndexError, TypeError, ValueError):
-            return {"error": f"Open-Meteo has no record for {timestamp} local time."}
+            temperature = humidity = wind_speed = code = None
+            hourly_error = f"Open-Meteo has no record for {timestamp} local time."
+        if hourly_error is None and all(value is None for value in (temperature, humidity, wind_speed, code)):
+            hourly_error = f"Open-Meteo has no measurements for {timestamp} local time."
+        if hourly_error and daily_summary is None:
+            return {"error": hourly_error}
 
-        if all(value is None for value in (temperature, humidity, wind_speed, code)):
-            return {"error": f"Open-Meteo has no measurements for {timestamp} local time."}
-        return {
+        weather = {
             "location": location,
             "local_time": timestamp,
             "timezone": result.get("timezone"),
@@ -499,6 +567,13 @@ class APIManager:
             "data_source": "Open-Meteo Historical Weather" if historical else "Open-Meteo Weather Forecast",
             "geocoding_attribution": "© OpenStreetMap contributors (Nominatim)",
         }
+        if daily_summary is not None:
+            weather["daily_wind_summary"] = daily_summary
+            if hourly_error:
+                # 目标小时缺数据时，其他小时仍可用于风速统计，并单独标注覆盖范围。
+                key = "hourly_error" if daily_summary["sample_count"] else "error"
+                weather[key] = hourly_error
+        return weather
 
     def compute(self, wolfram_query: str) -> dict[str, str]:
         """通过 Wolfram Alpha 执行数学计算，提取主要结果的纯文本。"""

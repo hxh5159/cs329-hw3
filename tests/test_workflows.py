@@ -3,7 +3,7 @@
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import DEFAULT, Mock, call, patch
+from unittest.mock import Mock, call, patch
 
 from cs329a_hw3.api_manager import APIManager
 from cs329a_hw3.DeepResearchAgent import DeepResearchAgent
@@ -13,6 +13,10 @@ from cs329a_hw3.multi_lm_agent import MultiLMAgent
 
 def observation(result, tool="get_stock_data"):
     return {"api_used": tool, "params": {}, "results": result, "error": None}
+
+
+def failed_observation(tool="get_stock_data"):
+    return {**observation(None, tool), "error": "Tool unavailable"}
 
 
 class AnswerWorkflowTests(unittest.TestCase):
@@ -95,25 +99,93 @@ class AnswerWorkflowTests(unittest.TestCase):
         self.assertIn("432.3", generate.call_args_list[2].args[0])
         self.assertEqual(generate.call_count, 3)
 
-    def test_planner_dispatches_only_one_supported_workflow(self):
-        cases = [
-            ("single", "single_LM_with_single_API_call", {}),
-            ("parallel", "decompose_and_fuse", {}),
-            ("sequential", "iterative_refine", {"max_iterations": 4}),
-            ("I recommend single or parallel.", "iterative_refine", {"max_iterations": 4}),
+    def test_pipeline_single_preserves_a_successful_tool_result(self):
+        self.tools.route_query.return_value = observation({"close": 42})
+        with patch.object(self.agent, "generate", side_effect=["single", "42 dollars"]) as generate:
+            answer = self.agent.run_pipeline("What was the closing price?")
+        self.assertEqual(answer, "42 dollars")
+        self.tools.route_query.assert_called_once_with("What was the closing price?", include_daily_weather=True)
+        self.assertIn('"close": 42', generate.call_args.args[0])
+
+    def test_pipeline_retries_a_failed_single_lookup_once(self):
+        self.tools.route_query.side_effect = [
+            failed_observation("get_weather"),
+            observation({"wind_speed": 8}, "get_weather"),
         ]
-        methods = {name: DEFAULT for _, name, _ in cases}
-        for response, chosen, kwargs in cases:
-            with (
-                self.subTest(response=response),
-                patch.object(self.agent, "generate", return_value=response),
-                patch.multiple(self.agent, **methods) as flows,
-            ):
-                flows[chosen].return_value = "Selected"
-                self.assertEqual(self.agent.run_pipeline("Original question"), "Selected")
-                flows[chosen].assert_called_once_with("Original question", **kwargs)
-                for name in methods.keys() - {chosen}:
-                    flows[name].assert_not_called()
+        query = "What was the wind speed?"
+        retry = "Look up wind speed for the specified location and hour"
+        with patch.object(self.agent, "generate", side_effect=[
+            "single", f"<sub-query>{retry}</sub-query>", "8 km/h"
+        ]) as generate:
+            answer = self.agent.run_pipeline(query)
+        self.assertEqual(answer, "8 km/h")
+        self.assertEqual(self.tools.route_query.call_args_list, [
+            call(query, include_daily_weather=True), call(retry, include_daily_weather=True)
+        ])
+        self.assertIn("Tool unavailable", generate.call_args_list[1].args[0])
+        self.assertIn('"wind_speed": 8', generate.call_args_list[2].args[0])
+
+    def test_pipeline_marks_model_reasoning_after_both_single_lookups_fail(self):
+        self.tools.route_query.return_value = failed_observation("compute")
+        query = "What is 17 plus 25?"
+        retry = "Calculate the sum of 17 and 25"
+        with patch.object(self.agent, "generate", side_effect=[
+            "single", f"<sub-query>{retry}</sub-query>", "42"
+        ]) as generate:
+            answer = self.agent.run_pipeline(query)
+        self.assertIn("42\n\n[Model-derived response.", answer)
+        self.assertEqual(self.tools.route_query.call_args_list, [
+            call(query, include_daily_weather=True), call(retry, include_daily_weather=True)
+        ])
+        self.assertIn("unavailable external evidence", generate.call_args.args[0])
+
+    def test_pipeline_parallel_preserves_partial_tool_evidence(self):
+        evidence = [observation({"close": 42}), failed_observation("compute")]
+        with (
+            patch.object(self.agent, "generate", return_value="parallel") as generate,
+            patch.object(self.agent, "decompose_query", return_value=evidence) as decompose,
+            patch.object(self.agent, "_fuse_observations", return_value="Evidence-based") as fuse,
+        ):
+            self.assertEqual(self.agent.run_pipeline("Original question"), "Evidence-based")
+        decompose.assert_called_once_with("Original question", for_pipeline=True)
+        fuse.assert_called_once_with("Original question", evidence)
+        self.assertEqual(generate.call_count, 1)
+
+    def test_pipeline_sequential_marks_model_answer_after_tool_failure(self):
+        self.tools.route_query.return_value = failed_observation("get_stock_data")
+        retry = "Look up closing price"
+        with patch.object(self.agent, "generate", side_effect=[
+            "Choose another workflow", f"<sub-query>{retry}</sub-query>",
+            "<final_answer>Unverified quote</final_answer>", "The closing price is unavailable."
+        ]):
+            answer = self.agent.run_pipeline("What was the closing price?")
+        self.tools.route_query.assert_called_once_with(retry, include_daily_weather=True)
+        self.assertNotIn("Unverified quote", answer)
+        self.assertIn("The closing price is unavailable.", answer)
+        self.assertIn("Tool verification unavailable", answer)
+
+    def test_part3_price_recovery_keeps_the_first_error_and_the_actual_price_source(self):
+        query = "What was the daily closing price?"
+        self.tools.route_query.return_value = {
+            **failed_observation(), "params": {"ticker": "MSFT", "date": "2024-05-01"}
+        }
+        bar = {"ticker": "MSFT", "close": 400, "currency": "USD", "source": "Yahoo Finance Chart"}
+        with patch("cs329a_hw3.multi_lm_agent.get_us_daily_bar", return_value=bar) as fetch:
+            result = self.agent._pipeline_observation(query)
+        fetch.assert_called_once_with("MSFT", "2024-05-01")
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["results"]["initial_lookup_error"], "Tool unavailable")
+        self.assertEqual(result["results"]["source"], "Yahoo Finance Chart")
+
+    def test_single_tool_benchmark_retains_the_original_failure_behavior(self):
+        self.tools.route_query.return_value = failed_observation("compute")
+        query = "What is 17 plus 25?"
+        with patch.object(self.agent, "generate", return_value="No computation result.") as generate:
+            answer = self.agent.single_LM_with_single_API_call(query)
+        self.assertEqual(answer, "No computation result.")
+        self.tools.route_query.assert_called_once_with(query)
+        self.assertEqual(generate.call_count, 1)
+        self.assertIn("an error is not evidence", generate.call_args.args[0])
 
     @patch("cs329a_hw3.evaluation.generate_together")
     def test_unavailable_judge_does_not_count_as_wrong(self, generate):

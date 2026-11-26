@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 from pydantic import BaseModel
 
 from cs329a_hw3.api_manager import APIManager
+from cs329a_hw3.market_history import get_us_daily_bar
 from cs329a_hw3.utils import generate_together, get_candidate_models, get_model
 
 
@@ -41,6 +42,10 @@ def _format_observations(observations: list[dict]) -> str:
             f"Error: {item.get('error') or 'none'}\nResult: {result}"
         )
     return "\n\n".join(blocks) or "No observations have been collected."
+
+
+def _has_tool_result(observations: list[dict]) -> bool:
+    return any(observation.get("results") and not observation.get("error") for observation in observations)
 
 
 class MultiLMAgent:
@@ -88,10 +93,13 @@ class MultiLMAgent:
             raise RuntimeError("The language model returned no answer text.")
         return content.strip()
 
-    def _observe(self, sub_query: str) -> dict:
+    def _observe(self, sub_query: str, *, whole_day_context: bool = False) -> dict:
         """保存子问题、路由选择、参数和实际结果，使每份证据能追溯到问题。"""
         try:
-            result = self.api_manager.route_query(sub_query)
+            if whole_day_context:
+                result = self.api_manager.route_query(sub_query, include_daily_weather=True)
+            else:
+                result = self.api_manager.route_query(sub_query)
             return {**result, "sub_query": sub_query}
         except Exception as exc:
             # 并行任务中，一座城市的查询失败不应抹去另一座城市的观测。
@@ -115,10 +123,17 @@ class MultiLMAgent:
             f"Question: {query}"
         )
 
-    def _get_sub_queries(self, query: str, max_sub_queries: int = 4) -> List[str]:
+    def _get_sub_queries(self, query: str, max_sub_queries: int = 4, *, for_pipeline: bool = False) -> List[str]:
         if max_sub_queries < 1:
             return []
         prompt = self._get_query_decomposition_prompt(query)
+        if for_pipeline:
+            # 一次行情/天气查询只能覆盖一个日期。最终回答仍需对照原问题。
+            prompt += (
+                "\nWrite a separate lookup for each independent date, city, or ticker needed. "
+                "Preserve the requested local time. For a whole-day weather comparison, ask "
+                "for whole-day statistics."
+            )
         try:
             plan = self.generate(
                 f"{prompt}\nReturn at most {max_sub_queries} lookups.",
@@ -136,15 +151,16 @@ class MultiLMAgent:
                 unique.setdefault(question.casefold(), question)
         return list(unique.values())[:max_sub_queries] or [query]
 
-    def decompose_query(self, query: str, max_sub_queries: int = 4) -> List[Dict[str, Any]]:
+    def decompose_query(self, query: str, max_sub_queries: int = 4, *, for_pipeline: bool = False) -> List[Dict[str, Any]]:
         """Part 2a：查多个独立事实，按拆题顺序返回每条观察。"""
-        sub_queries = self._get_sub_queries(query, max_sub_queries)
+        sub_queries = self._get_sub_queries(query, max_sub_queries, for_pipeline=for_pipeline)
         if not sub_queries:
             return []
         # 例：查两座城市同一天的天气，第二次请求无需等待第一次的风速。
         # map 让请求并行等待，同时保证返回顺序和输入顺序一致。
         with ThreadPoolExecutor(max_workers=min(4, len(sub_queries))) as pool:
-            return list(pool.map(self._observe, sub_queries))
+            observe = self._pipeline_observation if for_pipeline else self._observe
+            return list(pool.map(observe, sub_queries))
 
     def _get_synthesis_prompt(self, query: str, decomposed_queries: List[Dict[str, Any]] | None = None) -> str:
         """Part 2b：让模型看到原问题及各子问题的证据，再作比较、计算和总结。"""
@@ -158,7 +174,10 @@ class MultiLMAgent:
 
     def decompose_and_fuse(self, query: str) -> str:
         """Part 2c：多个模型独立解读同一批证据，再由融合模型写出一个答案。"""
-        prompt = self._get_synthesis_prompt(query, self.decompose_query(query))
+        return self._fuse_observations(query, self.decompose_query(query))
+
+    def _fuse_observations(self, query: str, observations: list[dict]) -> str:
+        prompt = self._get_synthesis_prompt(query, observations)
         models = get_candidate_models()
         candidates = []
         if models:
@@ -198,7 +217,16 @@ class MultiLMAgent:
 
     def iterative_refine(self, query: str, max_iterations: int = 3) -> str:
         """Part 2d：每轮读取最新观察，决定继续查询还是结束。"""
-        history = []
+        return self._refine_with_observations(query, max_iterations, [])
+
+    def _refine_with_observations(
+        self,
+        query: str,
+        max_iterations: int,
+        history: list[dict],
+        *,
+        allow_model_fallback: bool = False,
+    ) -> str:
         final_model = self.iterative_refinement_model
         for _ in range(max_iterations):
             # 例：先查收盘价，再用查到的实际价格计算涨幅。第二次请求
@@ -222,14 +250,50 @@ class MultiLMAgent:
                 break
             action, value = actions[0]
             if action.lower() == "final_answer":
+                if allow_model_fallback and history and not _has_tool_result(history):
+                    break
                 return value.strip()
-            history.append(self._observe(value.strip()))
+            observe = self._pipeline_observation if allow_model_fallback else self._observe
+            history.append(observe(value.strip()))
+        if allow_model_fallback and history and not _has_tool_result(history):
+            return self._model_derived_answer(query)
+
         # 最后一轮可能刚取得关键数据。即使查询预算已经用完，也让模型
         # 阅读这条观察并整理答案。这次收尾只生成文本，不会再查工具。
         return self.generate(
             self._get_synthesis_prompt(query, history),
             model=final_model, temperature=0,
         )
+
+    def _model_derived_answer(self, query: str) -> str:
+        # 工具失败后，题内计算和稳定事实仍可能独立解决。外部实测数据仍需来源。
+        prompt = (
+            "The attempted tools supplied no usable evidence. Solve the question if the given "
+            "information or well-established knowledge (including known past events) suffices. For a numerical or logical "
+            "problem, derive the result from the givens and check it. If the answer requires "
+            "a specific measurement, market quote, live status, private fact or other "
+            "unavailable external evidence, explain which fact is missing without inventing it. "
+            "Honor the requested language, units, precision and format. Do not claim that a "
+            "tool verified the answer.\n"
+            f"Question: {query}"
+        )
+        answer = self.generate(prompt, temperature=0)
+        if re.search(r"[\u3400-\u9fff]", query):
+            return f"{answer}\n\n[模型推导或判断，未获工具验证。]"
+        return f"{answer}\n\n[Model-derived response. Tool verification unavailable.]"
+
+    def _pipeline_observation(self, sub_query: str) -> dict:
+        observation = self._observe(sub_query, whole_day_context=True)
+        if observation.get("api_used") == "get_stock_data" and observation.get("error"):
+            # Part 1 保留原题的行情接口。Part 3 遇到错误时，按刚解析出的交易日
+            # 查询另一份公开日线。来源、价格口径和首查错误一起交给回答模型。
+            params = observation.get("params") or {}
+            if params.get("ticker") and params.get("date"):
+                bar = get_us_daily_bar(params["ticker"], params["date"])
+                if bar is not None:
+                    return {**observation, "api_used": "Yahoo Finance Chart", "error": None,
+                            "results": {**bar, "initial_lookup_error": observation["error"]}}
+        return observation
 
     def run_pipeline(self, query: str) -> str:
         """Part 3：由规划模型根据证据之间的依赖关系，选择问答流程。"""
@@ -238,8 +302,11 @@ class MultiLMAgent:
         instruction = (
             "Choose the cheapest workflow that can answer the question. Return exactly one "
             "word: single, parallel, or sequential. Use single when one tool lookup supplies "
-            "all facts (including a calculation on those facts). Use parallel when multiple "
-            "independent lookups can run together; use sequential when later lookups depend on "
+            "all facts (including a calculation on those facts). Each weather lookup covers just "
+            "one city on one local calendar date. Each market lookup covers one ticker on one "
+            "trading date. A comparison across cities or dates, or a question about all days in a range, "
+            "normally needs parallel lookups, one for every independent city/date combination. "
+            "Use sequential when later lookups depend on "
             "earlier observations or the needed evidence is unclear.\n"
             f"Question: {query}"
         )
@@ -250,9 +317,16 @@ class MultiLMAgent:
             logger.warning("Strategy planner unavailable; trying sequential lookups.")
             decision = "sequential"
         if decision == "single":
-            return self.single_LM_with_single_API_call(query)
+            observation = self._pipeline_observation(query)
+            if _has_tool_result([observation]):
+                return self.generate(self._get_synthesis_prompt(query, [observation]))
+            # 首次查不到时，让规划模型根据具体错误最多尝试一次改写查询。
+            return self._refine_with_observations(query, 1, [observation], allow_model_fallback=True)
         if decision == "parallel":
-            return self.decompose_and_fuse(query)
+            observations = self.decompose_query(query, for_pipeline=True)
+            if observations and not _has_tool_result(observations):
+                return self._model_derived_answer(query)
+            return self._fuse_observations(query, observations)
         # sequential 也适合作为标签无法解析时的回退：模型可以提前结束，
         # 同时仍然有机会根据工具反馈调整下一步。
-        return self.iterative_refine(query, max_iterations=4)
+        return self._refine_with_observations(query, 4, [], allow_model_fallback=True)

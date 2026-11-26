@@ -6,7 +6,8 @@ import socket
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from ddgs.exceptions import DDGSException
@@ -68,6 +69,26 @@ class APIManagerTests(unittest.TestCase):
         self.assertEqual(output["api_used"], "get_weather")
         self.assertIn("error", output)
         request.assert_not_called()
+
+    def test_route_attaches_requested_daily_summary_flag_only_to_weather(self):
+        cases = [
+            (
+                "get_weather", {"location": "New York", "date": "2025-08-01"},
+                {"location": "New York", "date": "2025-08-01", "hour": "12", "include_daily_summary": True},
+            ),
+            ("compute", {"wolfram_query": "2+2"}, {"wolfram_query": "2+2"}),
+        ]
+        for tool, parsed, passed in cases:
+            with self.subTest(tool=tool):
+                _, schema = self.manager.api_functions[tool]
+                result = {"actual_result": "available"}
+                execute = Mock(return_value=result)
+                with patch.dict(self.manager.api_functions, {tool: (execute, schema)}), patch(
+                    f"{MODULE}.generate_together", side_effect=[message({"api_name": tool}), message(parsed)]
+                ):
+                    output = self.manager.route_query("Query", include_daily_weather=True)
+                execute.assert_called_once_with(**passed)
+                self.assertEqual(output["results"], result)
 
     def test_routes_with_json_object_and_prompt_only_providers(self):
         examples = [
@@ -202,8 +223,71 @@ class APIManagerTests(unittest.TestCase):
                 self.assertEqual(output["wind_speed_unit"], "km/h")
                 self.assertEqual(output["weather_description"], "Thunderstorm")
                 self.assertIn("OpenStreetMap contributors", output["geocoding_attribution"])
+                self.assertNotIn("daily_wind_summary", output)
                 self.assertEqual(request.call_args.args[0], endpoint)
                 self.assertEqual(request.call_args.kwargs["params"]["timezone"], "auto")
+
+    def test_daily_wind_summary_uses_available_samples_and_flags_missing_coverage(self):
+        day = "2025-08-01"
+        hours = list(range(24))
+        winds = [float(hour) for hour in hours]
+        winds[6] = None
+        payload = {"timezone": "America/New_York", "hourly": {
+            "time": [f"{day}T{hour:02d}:00" for hour in hours] + ["2025-08-02T00:00"],
+            "temperature_2m": [20] * 24,
+            "relative_humidity_2m": [50] * 24,
+            "wind_speed_10m": winds + [180],
+            "weather_code": [0] * 24,
+        }}
+        with patch.object(self.manager, "_geocode", return_value=SimpleNamespace(
+            latitude=40.7, longitude=-74.0
+        )), patch.object(self.manager, "_get_json", return_value=payload) as request:
+            weather = self.manager.get_weather("New York", day, include_daily_summary=True)
+        request.assert_called_once()
+        summary = weather["daily_wind_summary"]
+        self.assertEqual(summary["date"], day)
+        self.assertEqual(summary["sample_count"], 23)
+        self.assertEqual(summary["max_wind_speed"], 23)
+        self.assertEqual(summary["wind_speed_unit"], "km/h")
+        self.assertAlmostEqual(summary["mean_wind_speed"], (sum(range(24)) - 6) / 23)
+        if summary["expected_sample_count"] is None:
+            self.assertEqual(summary["coverage"], "unknown")
+        else:
+            self.assertEqual(summary["expected_sample_count"], 24)
+            self.assertEqual(summary["coverage"], "partial")
+
+    def test_daily_wind_handles_spring_gap_and_autumn_fold(self):
+        try:
+            ZoneInfo("America/New_York")
+        except ZoneInfoNotFoundError:
+            self.skipTest("IANA timezone database is unavailable")
+
+        cases = [
+            ("2025-03-09", [0, 1, *range(3, 24)], "02", 23, "complete"),
+            ("2025-11-02", [0, 1, 1, *range(2, 24)], "12", 25, "complete"),
+            ("2025-11-02", list(range(24)), "12", 25, "partial"),
+        ]
+        for day, hours, requested_hour, expected, coverage in cases:
+            with self.subTest(day=day, coverage=coverage):
+                payload = {"timezone": "America/New_York", "hourly": {
+                    "time": [f"{day}T{hour:02d}:00" for hour in hours],
+                    "temperature_2m": [20] * len(hours),
+                    "relative_humidity_2m": [50] * len(hours),
+                    "wind_speed_10m": [10] * len(hours),
+                    "weather_code": [0] * len(hours),
+                }}
+                with patch.object(self.manager, "_geocode", return_value=SimpleNamespace(
+                    latitude=40.7, longitude=-74.0
+                )), patch.object(self.manager, "_get_json", return_value=payload):
+                    weather = self.manager.get_weather("New York", day, requested_hour, include_daily_summary=True)
+                summary = weather["daily_wind_summary"]
+                self.assertEqual(summary["sample_count"], len(hours))
+                self.assertEqual(summary["expected_sample_count"], expected)
+                self.assertEqual(summary["coverage"], coverage)
+                self.assertEqual(summary["mean_wind_speed"], 10)
+                if requested_hour == "02":
+                    self.assertIn("hourly_error", weather)
+                    self.assertNotIn("error", weather)
 
     def test_web_fetch_blocks_private_addresses_and_checks_redirects(self):
         public = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("93.184.216.34", 443))]
